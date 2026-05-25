@@ -6,9 +6,19 @@
   "description": "Right-click any product image or video frame on any site to search neutrally across retailers — no biased ranking. Patent Pending.",
   "permissions": ["activeTab", "storage", "scripting", "contextMenus", "notifications"],
   "host_permissions": ["<all_urls>"],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Neutralens"
+    "default_title": "Neutralens",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
   },
   "background": {
     "service_worker": "background.js",
