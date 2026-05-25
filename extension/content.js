@@ -1,0 +1,349 @@
+// Content script — runs on every page.
+// 1. Listens for token handoff postMessage from /extension/link (strict origin).
+// 2. Adds a small floating "Neutralens" pill on top of <video> elements.
+// 3. Renders search results in a draggable Shadow-DOM panel (Escape to dismiss).
+// All UI is built inside a closed Shadow DOM so we never touch host page styles
+// or DOM beyond a single mounted host element.
+
+(() => {
+  if (window.__neutralensInstalled) return;
+  window.__neutralensInstalled = true;
+
+  // --- Trusted-origin allowlist (loaded synchronously via manifest config) -
+  // Hard-coded mirror of extension/config.js NEUTRALENS_TRUSTED_ORIGINS.
+  // Keep in sync. Content scripts can't `import` ES modules, so we duplicate.
+  const TRUSTED_ORIGINS = new Set([
+    "https://neutralens.replit.app",
+  ]);
+
+  // --- Token handoff from the Neutralens website ----------------------------
+  window.addEventListener("message", (event) => {
+    const data = event?.data;
+    if (!data || typeof data !== "object") return;
+    if (data.source !== "neutralens-link" || typeof data.token !== "string") return;
+    // Same-window (no iframe) + exact origin allowlist.
+    if (event.source !== window) return;
+    if (!TRUSTED_ORIGINS.has(event.origin)) return;
+    chrome.runtime.sendMessage(
+      {
+        type: "NEUTRALENS_LINK_TOKEN",
+        token: data.token,
+        tier: data.tier ?? "free",
+        email: data.email ?? null,
+      },
+      () => {
+        // Acknowledge back to the page so it can show "linked".
+        window.postMessage({ source: "neutralens-extension", linked: true }, event.origin);
+      },
+    );
+  });
+
+  // --- Floating pill over <video> ------------------------------------------
+  const decoratedVideos = new WeakSet();
+
+  function decorateVideo(video) {
+    if (decoratedVideos.has(video)) return;
+    decoratedVideos.add(video);
+
+    const host = document.createElement("div");
+    host.setAttribute("data-neutralens-host", "video-pill");
+    host.style.cssText = `
+      position: absolute; z-index: 2147483646; pointer-events: none;
+      top: 0; left: 0;
+    `;
+    const shadow = host.attachShadow({ mode: "closed" });
+    shadow.innerHTML = `
+      <style>
+        .pill {
+          pointer-events: auto;
+          position: absolute; top: 12px; right: 12px;
+          background: rgba(15, 23, 42, 0.85); color: #fff;
+          font: 600 12px/1 -apple-system, system-ui, sans-serif;
+          padding: 8px 12px; border-radius: 999px;
+          cursor: pointer; backdrop-filter: blur(6px);
+          border: 1px solid rgba(255,255,255,0.15);
+          letter-spacing: 0.02em;
+        }
+        .pill:hover { background: rgba(15,23,42,1); }
+      </style>
+      <button class="pill" type="button">Neutralens this frame</button>
+    `;
+    shadow.querySelector(".pill").addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      captureFrameAndSearch(video).catch((err) =>
+        showPanelError(`Could not capture frame: ${err?.message ?? err}`),
+      );
+    });
+    const reposition = () => {
+      const rect = video.getBoundingClientRect();
+      host.style.top = `${rect.top + window.scrollY}px`;
+      host.style.left = `${rect.left + window.scrollX}px`;
+      host.style.width = `${rect.width}px`;
+      host.style.height = `${rect.height}px`;
+    };
+    reposition();
+    document.documentElement.appendChild(host);
+    new ResizeObserver(reposition).observe(video);
+    window.addEventListener("scroll", reposition, { passive: true });
+    window.addEventListener("resize", reposition, { passive: true });
+  }
+
+  function scanVideos() {
+    document.querySelectorAll("video").forEach((v) => {
+      if (v.clientWidth < 240 || v.clientHeight < 160) return;
+      decorateVideo(v);
+    });
+  }
+  new MutationObserver(scanVideos).observe(document.documentElement, {
+    subtree: true,
+    childList: true,
+  });
+  scanVideos();
+
+  async function captureFrameAndSearch(video) {
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth || video.clientWidth || 640;
+    canvas.height = video.videoHeight || video.clientHeight || 360;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas unavailable");
+    try {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    } catch {
+      // Cross-origin / tainted (e.g. YouTube). Forward to the website's
+      // server-side YouTube-frame flow in a new tab.
+      const url = `${getNeutralensBase()}/?youtubeUrl=${encodeURIComponent(window.location.href)}`;
+      window.open(url, "_blank");
+      return;
+    }
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+    openPanel({ kind: "loading", title: "Searching this frame…" });
+    const resp = await chrome.runtime.sendMessage({
+      type: "NEUTRALENS_SEARCH",
+      payload: { imageDataUrl: dataUrl, source: "ext-video", sourceUrl: window.location.href },
+    });
+    handleSearchResponse(resp);
+  }
+
+  function getNeutralensBase() {
+    // Mirrors config.js NEUTRALENS_BASE_URL. Content scripts can't import ESM.
+    return "https://neutralens.replit.app";
+  }
+
+  // --- Result panel (Shadow-DOM, draggable, Escape dismiss) ----------------
+  let panelHost = null;
+  let panelShadow = null;
+  let panelDragOffset = null;
+
+  function ensurePanel() {
+    if (panelHost) return panelShadow;
+    panelHost = document.createElement("div");
+    panelHost.setAttribute("data-neutralens-host", "results-panel");
+    panelHost.style.cssText = `
+      position: fixed; z-index: 2147483647; top: 20px; right: 20px;
+      width: 380px; max-height: calc(100vh - 40px); pointer-events: auto;
+    `;
+    panelShadow = panelHost.attachShadow({ mode: "closed" });
+    panelShadow.innerHTML = panelHtml();
+    document.documentElement.appendChild(panelHost);
+
+    // Drag by header.
+    const header = panelShadow.querySelector(".header");
+    header.addEventListener("pointerdown", (e) => {
+      const rect = panelHost.getBoundingClientRect();
+      panelDragOffset = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      header.setPointerCapture(e.pointerId);
+    });
+    header.addEventListener("pointermove", (e) => {
+      if (!panelDragOffset) return;
+      const x = Math.max(8, Math.min(window.innerWidth - 80, e.clientX - panelDragOffset.x));
+      const y = Math.max(8, Math.min(window.innerHeight - 40, e.clientY - panelDragOffset.y));
+      panelHost.style.left = `${x}px`;
+      panelHost.style.top = `${y}px`;
+      panelHost.style.right = "auto";
+    });
+    header.addEventListener("pointerup", () => {
+      panelDragOffset = null;
+    });
+
+    panelShadow.querySelector(".close").addEventListener("click", closePanel);
+
+    // Escape to close (key listener on document — does not modify host DOM).
+    document.addEventListener("keydown", onEscape);
+    return panelShadow;
+  }
+
+  function onEscape(e) {
+    if (e.key === "Escape" && panelHost) closePanel();
+  }
+
+  function closePanel() {
+    if (!panelHost) return;
+    panelHost.remove();
+    panelHost = null;
+    panelShadow = null;
+    document.removeEventListener("keydown", onEscape);
+  }
+
+  function openPanel(state) {
+    const shadow = ensurePanel();
+    renderPanelState(shadow, state);
+  }
+
+  function showPanelError(msg) {
+    openPanel({ kind: "error", message: msg });
+  }
+
+  function handleSearchResponse(resp) {
+    if (!resp) {
+      showPanelError("No response from extension background.");
+      return;
+    }
+    if (resp.ok === false) {
+      showPanelError(resp.error ?? "Search failed");
+      return;
+    }
+    const products = Array.isArray(resp.products) ? resp.products : [];
+    const query = resp.query ?? null;
+    openPanel({ kind: "results", products, query });
+  }
+
+  function panelHtml() {
+    return `
+      <style>
+        :host, .root { all: initial; }
+        .root {
+          display: flex; flex-direction: column;
+          background: #ffffff; color: #0f172a;
+          font: 13px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif;
+          border-radius: 12px; overflow: hidden;
+          box-shadow: 0 12px 32px rgba(15,23,42,0.18), 0 2px 6px rgba(15,23,42,0.10);
+          border: 1px solid rgba(15,23,42,0.10);
+        }
+        @media (prefers-color-scheme: dark) {
+          .root { background: #0b1220; color: #e2e8f0; border-color: rgba(255,255,255,0.10); }
+          .header { background: #111a2c !important; }
+          .item { border-color: rgba(255,255,255,0.08) !important; }
+          .price { color: #f1f5f9 !important; }
+          .meta { color: #94a3b8 !important; }
+        }
+        .header {
+          display: flex; align-items: center; justify-content: space-between;
+          padding: 10px 12px; background: #f8fafc;
+          cursor: grab; user-select: none;
+          border-bottom: 1px solid rgba(15,23,42,0.08);
+        }
+        .header:active { cursor: grabbing; }
+        .title { font: 600 13px/1 ui-serif, Georgia, serif; letter-spacing: 0.01em; }
+        .close {
+          background: transparent; border: 0; color: inherit; cursor: pointer;
+          font: 600 16px/1 system-ui, sans-serif; padding: 4px 8px; border-radius: 6px;
+        }
+        .close:hover { background: rgba(15,23,42,0.06); }
+        .body { padding: 12px; overflow: auto; max-height: 60vh; }
+        .empty, .err, .loading { padding: 20px 12px; text-align: center; color: #64748b; }
+        .err { color: #b91c1c; }
+        .item {
+          display: grid; grid-template-columns: 56px 1fr auto; gap: 10px;
+          padding: 10px; border: 1px solid rgba(15,23,42,0.08); border-radius: 8px;
+          align-items: center;
+        }
+        .item + .item { margin-top: 8px; }
+        .item img { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; background: #f1f5f9; }
+        .name { font-weight: 500; }
+        .name a { color: inherit; text-decoration: none; }
+        .name a:hover { text-decoration: underline; }
+        .meta { font-size: 11px; color: #64748b; margin-top: 2px; }
+        .price { font-weight: 700; tabular-nums: 1; white-space: nowrap; }
+        .footer {
+          padding: 8px 12px; font-size: 11px; color: #64748b;
+          border-top: 1px solid rgba(15,23,42,0.06);
+          display: flex; justify-content: space-between; align-items: center;
+        }
+        .footer a { color: inherit; text-decoration: underline; }
+        .spinner {
+          width: 18px; height: 18px; border-radius: 50%;
+          border: 2px solid rgba(100,116,139,0.3); border-top-color: #0f172a;
+          animation: spin 0.8s linear infinite; margin: 0 auto 8px;
+        }
+        @media (prefers-color-scheme: dark) {
+          .spinner { border-top-color: #e2e8f0; }
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+      </style>
+      <div class="root">
+        <div class="header">
+          <div class="title">Neutralens</div>
+          <button class="close" type="button" aria-label="Close">×</button>
+        </div>
+        <div class="body" data-body></div>
+        <div class="footer">
+          <span>Neutral ranking — no sponsored slots</span>
+          <a href="https://neutralens.replit.app" target="_blank" rel="noreferrer">Open</a>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderPanelState(shadow, state) {
+    const body = shadow.querySelector("[data-body]");
+    if (!body) return;
+    if (state.kind === "loading") {
+      body.innerHTML = `<div class="loading"><div class="spinner"></div>${escapeHtml(state.title ?? "Searching…")}</div>`;
+      return;
+    }
+    if (state.kind === "error") {
+      body.innerHTML = `<div class="err">${escapeHtml(state.message ?? "Search failed")}</div>`;
+      return;
+    }
+    if (state.kind === "results") {
+      const items = state.products ?? [];
+      if (items.length === 0) {
+        body.innerHTML = `<div class="empty">No matches found.</div>`;
+        return;
+      }
+      body.innerHTML = items
+        .slice(0, 10)
+        .map(
+          (p) => `
+            <div class="item">
+              <img src="${escapeHtml(p.imageUrl ?? "")}" alt="" />
+              <div>
+                <div class="name"><a href="${escapeHtml(p.affiliateUrl ?? p.productUrl ?? "#")}" target="_blank" rel="noreferrer">${escapeHtml(p.title ?? "Product")}</a></div>
+                <div class="meta">${escapeHtml(p.retailer ?? "")}</div>
+              </div>
+              <div class="price">${formatPrice(p.itemPrice, p.currency)}</div>
+            </div>
+          `,
+        )
+        .join("");
+    }
+  }
+
+  function formatPrice(amount, currency) {
+    if (typeof amount !== "number" || isNaN(amount)) return "";
+    try {
+      return new Intl.NumberFormat(undefined, {
+        style: "currency",
+        currency: currency || "USD",
+      }).format(amount);
+    } catch {
+      return `$${amount.toFixed(2)}`;
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+      c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === '"' ? "&quot;" : "&#39;",
+    );
+  }
+
+  // --- Listen for "open panel for image" from background context-menu ------
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg?.type === "NEUTRALENS_PANEL_LOADING") {
+      openPanel({ kind: "loading", title: msg.title });
+    } else if (msg?.type === "NEUTRALENS_PANEL_RESULTS") {
+      handleSearchResponse(msg.response);
+    }
+  });
+})();
