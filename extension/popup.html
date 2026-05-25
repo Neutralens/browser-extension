@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Neutralens</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { width: 320px; margin: 0; padding: 16px; font: 14px/1.4 -apple-system, system-ui, sans-serif; color: #0f172a; }
+      @media (prefers-color-scheme: dark) { body { color: #f1f5f9; background: #0b1220; } }
+      h1 { font: 600 16px/1.2 ui-serif, Georgia, serif; margin: 0 0 8px; }
+      p { margin: 8px 0; color: #475569; }
+      @media (prefers-color-scheme: dark) { p { color: #94a3b8; } }
+      .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 12px; }
+      button, a.btn { display: inline-block; padding: 8px 12px; border-radius: 8px; border: 1px solid currentColor; background: transparent; color: inherit; font: inherit; cursor: pointer; text-decoration: none; }
+      a.primary { background: #0f172a; color: #fff; border-color: #0f172a; }
+      @media (prefers-color-scheme: dark) { a.primary { background: #f1f5f9; color: #0b1220; border-color: #f1f5f9; } }
+      .tier { font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #e2e8f0; color: #0f172a; }
+      .tier.pro { background: #dbeafe; color: #1e40af; }
+      .tier.premium { background: #ede9fe; color: #6d28d9; }
+    </style>
+  </head>
+  <body>
+    <h1>Neutralens</h1>
+    <p id="status">Loading…</p>
+    <div class="row">
+      <span id="tier" class="tier free">free</span>
+      <span id="email" style="font-size:12px"></span>
+    </div>
+    <div class="row">
+      <a class="btn primary" id="open" href="https://neutralens.replit.app" target="_blank">Open Neutralens</a>
+      <a class="btn" id="link" href="https://neutralens.replit.app/extension/link" target="_blank">Link account</a>
+    </div>
+    <div class="row">
+      <button id="refresh" type="button">Refresh tier</button>
+      <button id="signout" type="button">Sign out</button>
+    </div>
+    <script src="popup.js" type="module"></script>
+  </body>
+</html>
