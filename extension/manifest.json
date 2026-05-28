@@ -6,12 +6,7 @@
   "description": "Right-click any product image or video frame on any site to search neutrally across retailers — no biased ranking. Patent Pending.",
   "permissions": ["activeTab", "storage", "scripting", "contextMenus", "notifications", "cookies"],
   "host_permissions": [
-    "<all_urls>",
-    "https://neutralens.com/*",
-    "https://*.neutralens.com/*",
-    "https://neutralens.replit.app/*",
-    "https://*.replit.app/*",
-    "https://*.replit.dev/*"
+    "<all_urls>"
   ],
   "icons": {
     "16": "icon16.png",
@@ -46,3 +41,4 @@
     }
   ]
 }
+
