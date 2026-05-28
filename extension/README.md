@@ -9,7 +9,8 @@ retailers via Neutralens, with no ranking bias.
 ## Install (Chrome / Edge / Brave / Arc)
 
 1. Edit `config.js` and set `NEUTRALENS_BASE_URL` to your deployment
-   (e.g. `https://neutralens.replit.app` or your custom domain).
+   (default `https://neutralens.com` — change if you self-host on a
+   different domain).
 2. Open `chrome://extensions` and toggle **Developer mode** on.
 3. Click **Load unpacked** and select this `extension/` folder.
 4. Visit the deployed Neutralens site, sign in, then open
