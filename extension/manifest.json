@@ -2,10 +2,17 @@
   "manifest_version": 3,
   "name": "Neutralens — neutral product search",
   "short_name": "Neutralens",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Right-click any product image or video frame on any site to search neutrally across retailers — no biased ranking. Patent Pending.",
-  "permissions": ["activeTab", "storage", "scripting", "contextMenus", "notifications"],
-  "host_permissions": ["<all_urls>"],
+  "permissions": ["activeTab", "storage", "scripting", "contextMenus", "notifications", "cookies"],
+  "host_permissions": [
+    "<all_urls>",
+    "https://neutralens.com/*",
+    "https://*.neutralens.com/*",
+    "https://neutralens.replit.app/*",
+    "https://*.replit.app/*",
+    "https://*.replit.dev/*"
+  ],
   "icons": {
     "16": "icon16.png",
     "48": "icon48.png",
