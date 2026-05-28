@@ -120,7 +120,7 @@
     openPanel({ kind: "loading", title: "Searching this frame…" });
     const resp = await chrome.runtime.sendMessage({
       type: "NEUTRALENS_SEARCH",
-      payload: { imageDataUrl: dataUrl, source: "ext-video", sourceUrl: window.location.href },
+      payload: { imageDataUrl: dataUrl, source: "video-frame", sourceUrl: window.location.href },
     });
     handleSearchResponse(resp);
   }
@@ -128,6 +128,71 @@
   function getNeutralensBase() {
     // Mirrors config.js NEUTRALENS_BASE_URL. Content scripts can't import ESM.
     return "https://neutralens.com";
+  }
+
+  // --- Image URL resolution (page context) ---------------------------------
+  // The server's /fetch-image only accepts https URLs, but image previews on
+  // some sites (Google Images lightbox, lazy-loaders, in-canvas editors) use
+  // blob: URLs that are only valid inside the page context. We resolve them
+  // here — either by lifting the real https URL out of nearby DOM hints, or
+  // by fetching the blob locally and converting it to a base64 data URL the
+  // background script can pass straight to /recognise.
+  function extractRealUrlFromDom(imgElement) {
+    if (!imgElement) return null;
+    const candidates = [
+      imgElement.getAttribute("data-iurl"),
+      imgElement.getAttribute("data-src"),
+      imgElement.getAttribute("data-original"),
+      imgElement.closest("a")?.href,
+      imgElement.closest("[data-url]")?.getAttribute("data-url"),
+    ];
+    for (const c of candidates) {
+      if (typeof c === "string" && c.startsWith("https://")) return c;
+    }
+    return null;
+  }
+
+  async function blobUrlToDataUrl(blobUrl) {
+    const response = await fetch(blobUrl);
+    if (!response.ok) throw new Error(`blob fetch failed: HTTP ${response.status}`);
+    const blob = await response.blob();
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result ?? ""));
+      reader.onerror = () => reject(reader.error ?? new Error("FileReader failed"));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function findImgBySrc(srcUrl) {
+    if (!srcUrl) return null;
+    const all = document.querySelectorAll("img");
+    for (const img of all) {
+      if (img.currentSrc === srcUrl || img.src === srcUrl) return img;
+    }
+    return null;
+  }
+
+  async function resolveImageUrl(srcUrl, imgElement) {
+    if (typeof srcUrl !== "string" || srcUrl.length === 0) {
+      return { type: "fallback", value: srcUrl ?? "" };
+    }
+    if (srcUrl.startsWith("https://")) return { type: "url", value: srcUrl };
+    if (srcUrl.startsWith("data:")) return { type: "dataUrl", value: srcUrl };
+    if (srcUrl.startsWith("blob:")) {
+      const domUrl = extractRealUrlFromDom(imgElement ?? findImgBySrc(srcUrl));
+      if (domUrl) return { type: "url", value: domUrl };
+      try {
+        const dataUrl = await blobUrlToDataUrl(srcUrl);
+        return { type: "dataUrl", value: dataUrl };
+      } catch {
+        return { type: "fallback", value: srcUrl };
+      }
+    }
+    if (srcUrl.startsWith("http://")) {
+      return { type: "url", value: "https://" + srcUrl.slice("http://".length) };
+    }
+    return { type: "fallback", value: srcUrl };
   }
 
   // --- Result panel (Shadow-DOM, draggable, Escape dismiss) ----------------
@@ -520,11 +585,29 @@
   }
 
   // --- Listen for "open panel for image" from background context-menu ------
-  chrome.runtime.onMessage.addListener((msg) => {
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg?.type === "NEUTRALENS_PANEL_LOADING") {
       openPanel({ kind: "loading", title: msg.title });
-    } else if (msg?.type === "NEUTRALENS_PANEL_RESULTS") {
-      handleSearchResponse(msg.response);
+      return false;
     }
+    if (msg?.type === "NEUTRALENS_PANEL_RESULTS") {
+      handleSearchResponse(msg.response);
+      return false;
+    }
+    if (msg?.type === "NEUTRALENS_RESOLVE_IMAGE_URL") {
+      // Resolve blob:/http:/etc. in the page context where blob URLs are
+      // still valid. Always respond, even on error, so the background script
+      // never hangs waiting on us.
+      (async () => {
+        try {
+          const resolved = await resolveImageUrl(msg.srcUrl, null);
+          sendResponse(resolved);
+        } catch (err) {
+          sendResponse({ type: "fallback", value: msg.srcUrl ?? "", error: String(err?.message ?? err) });
+        }
+      })();
+      return true;
+    }
+    return false;
   });
 })();
