@@ -31,3 +31,4 @@ document.getElementById("signout").addEventListener("click", async () => {
 });
 
 void render();
+
