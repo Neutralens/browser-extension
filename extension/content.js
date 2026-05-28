@@ -13,7 +13,7 @@
   // Hard-coded mirror of extension/config.js NEUTRALENS_TRUSTED_ORIGINS.
   // Keep in sync. Content scripts can't `import` ES modules, so we duplicate.
   const TRUSTED_ORIGINS = new Set([
-    "https://neutralens.replit.app",
+    "https://neutralens.com",
   ]);
 
   // --- Token handoff from the Neutralens website ----------------------------
@@ -127,7 +127,7 @@
 
   function getNeutralensBase() {
     // Mirrors config.js NEUTRALENS_BASE_URL. Content scripts can't import ESM.
-    return "https://neutralens.replit.app";
+    return "https://neutralens.com";
   }
 
   // --- Result panel (Shadow-DOM, draggable, Escape dismiss) ----------------
@@ -194,6 +194,10 @@
     openPanel({ kind: "error", message: msg });
   }
 
+  // Last successful search context — kept so "Not quite right?" chips can
+  // re-call /search with the same imageHash while only swapping the query.
+  let lastSearchContext = null;
+
   function handleSearchResponse(resp) {
     if (!resp) {
       showPanelError("No response from extension background.");
@@ -205,7 +209,47 @@
     }
     const products = Array.isArray(resp.products) ? resp.products : [];
     const query = resp.query ?? null;
-    openPanel({ kind: "results", products, query });
+    const enrichment = resp.enrichment ?? null;
+    const imageHash = typeof resp.imageHash === "string" ? resp.imageHash : null;
+    const isImageSearch = resp.isImageSearch !== false && (imageHash !== null || enrichment !== null);
+    lastSearchContext = { imageHash, enrichment, isImageSearch };
+    openPanel({ kind: "results", products, query, enrichment, isImageSearch });
+  }
+
+  async function refineSearch(label) {
+    if (!label || !lastSearchContext) return;
+    // Snapshot the context now so a concurrent NEUTRALENS_SEARCH starting
+    // mid-flight can't cross-wire enrichment/chips into this re-render.
+    const ctx = lastSearchContext;
+    openPanel({ kind: "loading", title: `Searching for "${label}"…` });
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        type: "NEUTRALENS_REFINE_SEARCH",
+        payload: { query: label, imageHash: ctx.imageHash },
+      });
+      if (!resp || resp.ok === false) {
+        showPanelError(resp?.error ?? "Search failed");
+        return;
+      }
+      const products = Array.isArray(resp.products) ? resp.products : [];
+      // Preserve the original enrichment so the chips stay visible — the
+      // user may want to try a different alternative. If the refine returned
+      // nothing, surface a hint inline rather than the generic "No matches".
+      openPanel({
+        kind: "results",
+        products,
+        query: resp.query ?? label,
+        enrichment: ctx.enrichment,
+        isImageSearch: ctx.isImageSearch,
+        chosenLabel: label,
+        emptyHint:
+          products.length === 0
+            ? `No matches for "${label}". Try another option above.`
+            : null,
+      });
+    } catch (err) {
+      showPanelError(String(err?.message ?? err));
+    }
   }
 
   function panelHtml() {
@@ -261,6 +305,50 @@
           display: flex; justify-content: space-between; align-items: center;
         }
         .footer a { color: inherit; text-decoration: underline; }
+        .enrichment {
+          border: 1px solid #a7f3d0; background: #ecfdf5;
+          border-radius: 8px; padding: 10px; margin-bottom: 10px;
+          color: #064e3b;
+        }
+        @media (prefers-color-scheme: dark) {
+          .enrichment { background: rgba(16,185,129,0.08); border-color: rgba(16,185,129,0.35); color: #d1fae5; }
+          .enrich-tag { color: #6ee7b7 !important; }
+          .enrich-meta { color: #94a3b8 !important; }
+          .chip { background: #0b1220 !important; border-color: rgba(16,185,129,0.45) !important; color: #d1fae5 !important; }
+          .chip:hover:not(:disabled) { background: rgba(16,185,129,0.15) !important; }
+          .badge { background: #0b1220 !important; }
+        }
+        .enrich-tag {
+          font: 600 10px/1 -apple-system, system-ui, sans-serif;
+          letter-spacing: 0.06em; text-transform: uppercase;
+          color: #047857; margin-bottom: 4px;
+        }
+        .enrich-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+        .enrich-label {
+          font: 600 10px/1 -apple-system, system-ui, sans-serif;
+          letter-spacing: 0.06em; text-transform: uppercase;
+          color: #64748b; margin-bottom: 2px;
+        }
+        .enrich-identified { font: 600 13px/1.3 -apple-system, system-ui, sans-serif; word-break: break-word; }
+        .enrich-meta { font-size: 11px; color: #475569; margin-top: 2px; text-transform: capitalize; }
+        .badge {
+          font: 500 10px/1 -apple-system, system-ui, sans-serif;
+          padding: 3px 6px; border-radius: 999px; white-space: nowrap;
+          background: #ffffff; border: 1px solid;
+        }
+        .badge.medium { border-color: #6ee7b7; color: #047857; }
+        .badge.low { border-color: #fcd34d; color: #b45309; }
+        .chips-label { font-size: 11px; color: #475569; margin: 8px 0 4px; }
+        .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+        .chip {
+          font: 500 11px/1 -apple-system, system-ui, sans-serif;
+          padding: 4px 10px; border-radius: 999px;
+          border: 1px solid #6ee7b7; background: #ffffff; color: #064e3b;
+          cursor: pointer;
+        }
+        .chip:hover:not(:disabled) { background: #d1fae5; }
+        .chip:disabled { opacity: 0.5; cursor: default; }
+        .chip[data-active="true"] { background: #047857; color: #ffffff; border-color: #047857; }
         .spinner {
           width: 18px; height: 18px; border-radius: 50%;
           border: 2px solid rgba(100,116,139,0.3); border-top-color: #0f172a;
@@ -279,7 +367,7 @@
         <div class="body" data-body></div>
         <div class="footer">
           <span>Neutral ranking — no sponsored slots</span>
-          <a href="https://neutralens.replit.app" target="_blank" rel="noreferrer">Open</a>
+          <a href="https://neutralens.com" target="_blank" rel="noreferrer">Open</a>
         </div>
       </div>
     `;
@@ -298,14 +386,14 @@
     }
     if (state.kind === "results") {
       const items = state.products ?? [];
-      if (items.length === 0) {
-        body.innerHTML = `<div class="empty">No matches found.</div>`;
-        return;
-      }
-      body.innerHTML = items
-        .slice(0, 10)
-        .map(
-          (p) => `
+      const enrichmentHtml = renderEnrichmentHtml(state);
+      const itemsHtml =
+        items.length === 0
+          ? `<div class="empty">${escapeHtml(state.emptyHint ?? "No matches found.")}</div>`
+          : items
+              .slice(0, 10)
+              .map(
+                (p) => `
             <div class="item">
               <img src="${escapeHtml(p.imageUrl ?? "")}" alt="" />
               <div>
@@ -315,9 +403,102 @@
               <div class="price">${formatPrice(p.itemPrice, p.currency)}</div>
             </div>
           `,
-        )
-        .join("");
+              )
+              .join("");
+      body.innerHTML = enrichmentHtml + itemsHtml;
+      // Wire chip clicks (closed Shadow DOM — handlers must be attached via JS).
+      body.querySelectorAll("[data-alt]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const label = btn.getAttribute("data-alt");
+          // Visual feedback before the next render replaces the panel.
+          body.querySelectorAll("[data-alt]").forEach((b) => (b.disabled = true));
+          btn.setAttribute("data-active", "true");
+          refineSearch(label);
+        });
+      });
     }
+  }
+
+  // Mirror of the web app's EnrichmentPanel: header tag, identified label,
+  // optional metadata line, confidence badge (omitted for high confidence),
+  // and "Not quite right?" alternative chips parsed from `enrichment.notes`.
+  function renderEnrichmentHtml(state) {
+    const enrichment = state.enrichment;
+    if (!enrichment) return "";
+    const brand = typeof enrichment.brand === "string" ? enrichment.brand.trim() : "";
+    const productName =
+      typeof enrichment.product_name === "string" ? enrichment.product_name.trim() : "";
+    const identified =
+      brand && productName ? `${brand} ${productName}` : brand || productName || null;
+    const headline = identified ?? enrichment.search_query ?? state.query ?? "Product";
+    const metaParts = [enrichment.color, enrichment.material, enrichment.style]
+      .map((v) => (typeof v === "string" ? v.trim() : ""))
+      .filter((v) => v.length > 0);
+    const metaHtml =
+      metaParts.length > 0
+        ? `<div class="enrich-meta">${escapeHtml(metaParts.join(" · "))}</div>`
+        : "";
+    const tagHtml = state.isImageSearch
+      ? `<div class="enrich-tag">AI-identified from creator image</div>`
+      : "";
+    const conf = enrichment.confidence;
+    const badgeHtml =
+      conf === "medium"
+        ? `<span class="badge medium">Best match</span>`
+        : conf === "low"
+          ? `<span class="badge low">Approximate match</span>`
+          : "";
+    // Alternative chips — best-effort comma/semicolon split of `notes`,
+    // matching the web app's filter rules (≥3 chars, ≤60 chars, not the
+    // identified label, not the search query).
+    const baseLower = (identified ?? "").toLowerCase();
+    const queryLower = (enrichment.search_query ?? "").toLowerCase();
+    const alts =
+      typeof enrichment.notes === "string"
+        ? enrichment.notes
+            .split(/[,;]/)
+            .map((s) => s.trim())
+            .filter(
+              (s) =>
+                s.length > 2 &&
+                s.length <= 60 &&
+                s.toLowerCase() !== baseLower &&
+                s.toLowerCase() !== queryLower,
+            )
+            .slice(0, 4)
+        : [];
+    const activeLabel = state.chosenLabel ?? null;
+    const chipsHtml =
+      alts.length > 0
+        ? `
+          <div class="chips-label">Not quite right?</div>
+          <div class="chips">
+            ${alts
+              .map(
+                (alt) => `
+              <button type="button" class="chip" data-alt="${escapeHtml(alt)}"${
+                  activeLabel && activeLabel === alt ? ` data-active="true"` : ""
+                }>${escapeHtml(alt)}</button>
+            `,
+              )
+              .join("")}
+          </div>
+        `
+        : "";
+    return `
+      <div class="enrichment">
+        ${tagHtml}
+        <div class="enrich-row">
+          <div style="min-width:0">
+            <div class="enrich-label">Identified as</div>
+            <div class="enrich-identified">${escapeHtml(headline)}</div>
+            ${metaHtml}
+          </div>
+          ${badgeHtml}
+        </div>
+        ${chipsHtml}
+      </div>
+    `;
   }
 
   function formatPrice(amount, currency) {
