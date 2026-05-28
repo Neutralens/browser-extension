@@ -19,12 +19,58 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!tab?.id) return;
   if (info.menuItemId === MENU_IMAGE && info.srcUrl) {
+    // Target the specific frame the user right-clicked in — Google Images,
+    // YouTube cards, embedded shopping widgets, etc. all live in iframes,
+    // and blob: URLs are only valid in the frame that minted them. Falls
+    // back to the top frame if frameId isn't provided.
+    const frameOpts = typeof info.frameId === "number" ? { frameId: info.frameId } : undefined;
     try {
-      await chrome.tabs.sendMessage(tab.id, {
-        type: "NEUTRALENS_PANEL_LOADING",
-        title: "Searching image…",
-      });
-      const out = await runImageSearch({ imageUrl: info.srcUrl, sourceUrl: tab.url ?? null });
+      // Best-effort loading state — content script may not be loaded on
+      // restricted pages (chrome://, the Chrome Web Store, etc.). Don't let
+      // that abort the rest of the flow.
+      try {
+        await chrome.tabs.sendMessage(
+          tab.id,
+          { type: "NEUTRALENS_PANEL_LOADING", title: "Searching image…" },
+          frameOpts,
+        );
+      } catch {
+        // ignore — proceed without the loading affordance.
+      }
+      // Some pages (Google Images lightbox, in-canvas editors) hand us a
+      // blob: URL that's only valid inside the page context. Ask the content
+      // script to resolve it first — it can either lift a real https URL out
+      // of nearby DOM hints, or fetch the blob locally and convert it to a
+      // data URL we can pass straight to /recognise.
+      let resolved = null;
+      try {
+        resolved = await chrome.tabs.sendMessage(
+          tab.id,
+          { type: "NEUTRALENS_RESOLVE_IMAGE_URL", srcUrl: info.srcUrl },
+          frameOpts,
+        );
+      } catch {
+        // Content script unreachable. Fall through with a synthesized
+        // resolution so the existing path runs unchanged — but only if the
+        // URL is something /fetch-image can actually handle (https). blob:
+        // and other unfetchable schemes go straight to fallback.
+        resolved = info.srcUrl.startsWith("https://")
+          ? { type: "url", value: info.srcUrl }
+          : { type: "fallback", value: info.srcUrl };
+      }
+      const sourceUrl = tab.url ?? null;
+      let out;
+      if (resolved?.type === "dataUrl" && typeof resolved.value === "string") {
+        out = await runDataUrlSearch({
+          imageDataUrl: resolved.value,
+          sourceUrl,
+          source: "image",
+        });
+      } else if (resolved?.type === "url" && typeof resolved.value === "string") {
+        out = await runImageSearch({ imageUrl: resolved.value, sourceUrl });
+      } else {
+        out = openFallback(sourceUrl ?? info.srcUrl);
+      }
       await chrome.tabs.sendMessage(tab.id, {
         type: "NEUTRALENS_PANEL_RESULTS",
         response: out,
@@ -114,7 +160,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             query: query.trim(),
             imageHash: typeof imageHash === "string" ? imageHash : undefined,
             maxResults: 10,
-            source: "ext-refine",
+            source: "image",
           }),
         });
         sendResponse({ ok: true, query: query.trim(), products: out?.products ?? [] });
@@ -208,7 +254,7 @@ async function runImageSearch({ imageUrl, sourceUrl, source }) {
   }
   return await runRecogniseAndSearch(
     { base64: fetched.base64, mimeType: fetched.mimeType ?? "image/jpeg" },
-    source ?? "ext-image",
+    source ?? "image",
     sourceUrl ?? imageUrl,
   );
 }
@@ -221,7 +267,7 @@ async function runDataUrlSearch({ imageDataUrl, sourceUrl, source }) {
   const base64 = match[2] ?? "";
   return await runRecogniseAndSearch(
     { base64, mimeType },
-    source ?? "ext-frame",
+    source ?? "video-frame",
     sourceUrl,
   );
 }
