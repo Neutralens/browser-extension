@@ -124,12 +124,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg?.type === "NEUTRALENS_SEARCH" && msg.payload) {
-    const { imageUrl, imageDataUrl, sourceUrl, source } = msg.payload;
+    const { imageUrl, imageDataUrl, sourceUrl, source, cropRegion } = msg.payload;
     (async () => {
       try {
         const out = imageDataUrl
           ? await runDataUrlSearch({ imageDataUrl, sourceUrl, source })
-          : await runImageSearch({ imageUrl, sourceUrl, source });
+          : await runImageSearch({ imageUrl, sourceUrl, source, cropRegion });
         sendResponse(out);
       } catch (err) {
         if (isContentSafetyError(err)) {
@@ -243,11 +243,17 @@ if (chrome.cookies && chrome.cookies.onChanged) {
   });
 }
 
-async function runImageSearch({ imageUrl, sourceUrl, source }) {
-  // /fetch-image expects { url } and returns { base64, mimeType, byteSize }.
+async function runImageSearch({ imageUrl, sourceUrl, source, cropRegion }) {
+  // /fetch-image expects { url, cropRegion? } and returns { base64, mimeType,
+  // byteSize }. The optional cropRegion lets the server crop CORS-tainted
+  // images that the extension could not crop client-side (tap-to-detect).
+  const fetchBody = { url: imageUrl };
+  if (cropRegion && typeof cropRegion === "object") {
+    fetchBody.cropRegion = cropRegion;
+  }
   const fetched = await fetchJson(`${NEUTRALENS_API_BASE}/fetch-image`, {
     method: "POST",
-    body: JSON.stringify({ url: imageUrl }),
+    body: JSON.stringify(fetchBody),
   });
   if (!fetched?.base64) {
     return openFallback(sourceUrl ?? imageUrl);
@@ -272,14 +278,26 @@ async function runDataUrlSearch({ imageDataUrl, sourceUrl, source }) {
   );
 }
 
+// Map a client-side source label onto the server's accepted source enum
+// (['image','url','text','video-frame']). 'ext-tap' (tap-to-detect crops) is a
+// client-only concept and is treated as an image search server-side.
+function toServerSource(source) {
+  if (source === "ext-tap") return "image";
+  const allowed = ["image", "url", "text", "video-frame"];
+  return allowed.includes(source) ? source : "image";
+}
+
 function objectsToQuery(objects) {
   if (!Array.isArray(objects) || objects.length === 0) return null;
+  // Use only the single highest-confidence label so the initial results match
+  // the object-picker's default chip exactly (the panel marks the top object as
+  // the active default). Joining multiple labels would desync the active chip
+  // from the results actually shown.
   const top = [...objects]
     .sort((a, b) => (b?.confidence ?? 0) - (a?.confidence ?? 0))
-    .slice(0, 2)
     .map((o) => o?.label)
     .filter(Boolean);
-  return top.length ? top.join(" ") : null;
+  return top.length ? top[0] : null;
 }
 
 function openFallback(sourceUrl) {
@@ -309,7 +327,10 @@ async function runRecogniseAndSearch({ base64, mimeType }, source, sourceUrl) {
     query,
     imageHash,
     maxResults: 10,
-    source,
+    // The server's source enum is ['image','url','text','video-frame']. The
+    // tap-to-detect feature uses a client-only 'ext-tap' source for our own
+    // telemetry; map it to 'image' so server validation accepts it.
+    source: toServerSource(source),
     objectsDetected: objects,
   };
   const out = await fetchJson(`${NEUTRALENS_API_BASE}/search`, {
@@ -323,6 +344,7 @@ async function runRecogniseAndSearch({ base64, mimeType }, source, sourceUrl) {
     enrichment,
     imageHash,
     isImageSearch: true,
+    objectsDetected: objects,
   };
 }
 
