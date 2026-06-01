@@ -36,7 +36,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["shadow-panel.html", "shadow-panel.css"],
+      "resources": ["shadow-panel.html", "shadow-panel.css", "icon128.png"],
       "matches": ["<all_urls>"]
     }
   ]
