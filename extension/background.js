@@ -25,18 +25,20 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     // back to the top frame if frameId isn't provided.
     const frameOpts = typeof info.frameId === "number" ? { frameId: info.frameId } : undefined;
     try {
-      // Best-effort loading state — content script may not be loaded on
-      // restricted pages (chrome://, the Chrome Web Store, etc.). Don't let
-      // that abort the rest of the flow.
-      try {
-        await chrome.tabs.sendMessage(
-          tab.id,
-          { type: "NEUTRALENS_PANEL_LOADING", title: "Searching image…" },
-          frameOpts,
-        );
-      } catch {
-        // ignore — proceed without the loading affordance.
-      }
+      // Content scripts are NOT retro-injected into tabs that were already
+      // open when the extension was installed/updated, so messaging them fails
+      // with "Receiving end does not exist". Proactively (re)inject before we
+      // talk to the panel — content.js guards against double-injection
+      // (window.__neutralensInstalled), so this is a no-op when already there.
+      await ensureContentScript(tab.id, frameOpts);
+      // Best-effort loading state — the content script may still be absent on
+      // restricted pages (chrome://, the Chrome Web Store, etc.) where even
+      // injection is disallowed. Don't let that abort the rest of the flow.
+      await sendToPanel(
+        tab.id,
+        { type: "NEUTRALENS_PANEL_LOADING", title: "Searching image…" },
+        frameOpts,
+      );
       // Some pages (Google Images lightbox, in-canvas editors) hand us a
       // blob: URL that's only valid inside the page context. Ask the content
       // script to resolve it first — it can either lift a real https URL out
@@ -71,22 +73,50 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       } else {
         out = openFallback(sourceUrl ?? info.srcUrl);
       }
-      await chrome.tabs.sendMessage(tab.id, {
-        type: "NEUTRALENS_PANEL_RESULTS",
-        response: out,
-      });
+      // Deliver results to the panel. If the panel is unreachable (restricted
+      // page where injection is disallowed), don't silently drop the search —
+      // open the results in a Neutralens web tab instead.
+      const delivered = await sendToPanel(
+        tab.id,
+        { type: "NEUTRALENS_PANEL_RESULTS", response: out },
+        frameOpts,
+      );
+      if (!delivered) {
+        // Prefer the actual image URL so the web tab reproduces the image
+        // search. tab.url is the *page*, not the image, so it isn't a valid
+        // imageUrl input — fall back to the clicked srcUrl when we don't have
+        // a resolved https image URL.
+        const fallbackImage =
+          resolved?.type === "url" && typeof resolved.value === "string"
+            ? resolved.value
+            : info.srcUrl;
+        await openResultsTab(out, fallbackImage);
+      }
     } catch (err) {
       if (isContentSafetyError(err)) {
         notifyContentSafety();
-        await chrome.tabs.sendMessage(tab.id, {
-          type: "NEUTRALENS_PANEL_RESULTS",
-          response: { ok: false, error: CONTENT_SAFETY_MESSAGE, code: "CONTENT_SAFETY" },
-        });
+        await sendToPanel(
+          tab.id,
+          {
+            type: "NEUTRALENS_PANEL_RESULTS",
+            response: { ok: false, error: CONTENT_SAFETY_MESSAGE, code: "CONTENT_SAFETY" },
+          },
+          frameOpts,
+        );
       } else {
-        await chrome.tabs.sendMessage(tab.id, {
-          type: "NEUTRALENS_PANEL_RESULTS",
-          response: { ok: false, error: String(err?.message ?? err) },
-        });
+        const delivered = await sendToPanel(
+          tab.id,
+          {
+            type: "NEUTRALENS_PANEL_RESULTS",
+            response: { ok: false, error: String(err?.message ?? err) },
+          },
+          frameOpts,
+        );
+        // No panel to surface the error — degrade to a web search tab so the
+        // user can still complete their search instead of getting nothing.
+        if (!delivered) {
+          await openResultsTab(null, info.srcUrl);
+        }
       }
     }
   } else if (info.menuItemId === MENU_PAGE) {
@@ -303,6 +333,53 @@ function objectsToQuery(objects) {
 function openFallback(sourceUrl) {
   const fallback = `${NEUTRALENS_BASE_URL}/?imageUrl=${encodeURIComponent(sourceUrl ?? "")}`;
   return { ok: true, products: [], query: null, fallbackUrl: fallback };
+}
+
+// Best-effort: ensure the page's content script is present before we message
+// it. Content scripts are not retro-injected into tabs that were already open
+// when the extension was installed/updated, so messaging them otherwise fails
+// with "Receiving end does not exist". content.js guards against double
+// injection, so re-injecting an already-present script is a harmless no-op.
+async function ensureContentScript(tabId, frameOpts) {
+  if (!chrome.scripting?.executeScript) return;
+  const target = { tabId };
+  if (frameOpts && typeof frameOpts.frameId === "number") {
+    target.frameIds = [frameOpts.frameId];
+  }
+  try {
+    await chrome.scripting.executeScript({ target, files: ["content.js"] });
+  } catch {
+    // Restricted pages (chrome://, the Chrome Web Store, PDF viewer, other
+    // extensions) disallow injection. The caller degrades gracefully.
+  }
+}
+
+// Best-effort message to the page's content-script panel. Swallows the
+// "Receiving end does not exist" rejection that occurs when no content script
+// is listening, so it can never escape as an uncaught promise rejection.
+// Returns true only when the message was actually delivered.
+async function sendToPanel(tabId, message, frameOpts) {
+  try {
+    await chrome.tabs.sendMessage(tabId, message, frameOpts);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Graceful degradation when the in-page panel can't be reached: open the
+// result (or a fresh image search) in a Neutralens web tab so the user's
+// search isn't silently lost.
+async function openResultsTab(out, fallbackSourceUrl) {
+  const url =
+    out && typeof out.fallbackUrl === "string" && out.fallbackUrl
+      ? out.fallbackUrl
+      : `${NEUTRALENS_BASE_URL}/?imageUrl=${encodeURIComponent(fallbackSourceUrl ?? "")}`;
+  try {
+    await chrome.tabs.create({ url });
+  } catch {
+    // Best effort — nothing more we can do.
+  }
 }
 
 async function runRecogniseAndSearch({ base64, mimeType }, source, sourceUrl) {
