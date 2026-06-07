@@ -193,7 +193,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             source: "image",
           }),
         });
-        sendResponse({ ok: true, query: query.trim(), products: out?.products ?? [] });
+        sendResponse({ ok: true, query: query.trim(), products: out?.results ?? out?.products ?? [] });
       } catch (err) {
         if (isContentSafetyError(err)) {
           notifyContentSafety();
@@ -417,7 +417,7 @@ async function runRecogniseAndSearch({ base64, mimeType }, source, sourceUrl) {
   return {
     ok: true,
     query,
-    products: out?.products ?? [],
+    products: out?.results ?? out?.products ?? [],
     enrichment,
     imageHash,
     isImageSearch: true,
