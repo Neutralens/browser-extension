@@ -69,7 +69,14 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
           source: "image",
         });
       } else if (resolved?.type === "url" && typeof resolved.value === "string") {
-        out = await runImageSearch({ imageUrl: resolved.value, sourceUrl });
+        // Whole-image right-click: explicitly an "image" source with NO crop
+        // region. This keeps it off the crop spine (isCropRegion stays false)
+        // so Lens can never fire for it, regardless of consent/Gate A state.
+        out = await runImageSearch({
+          imageUrl: resolved.value,
+          sourceUrl,
+          source: "image",
+        });
       } else {
         out = openFallback(sourceUrl ?? info.srcUrl);
       }
@@ -153,6 +160,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     void refreshMe().then(sendResponse).catch((err) => sendResponse({ ok: false, error: String(err?.message ?? err) }));
     return true;
   }
+  if (msg?.type === "NEUTRALENS_VS_GET_STATE") {
+    void getVisualSearchState()
+      .then(sendResponse)
+      .catch(() => sendResponse({ eligible: false, consent: false, nudgeSeen: false }));
+    return true;
+  }
+  if (msg?.type === "NEUTRALENS_VS_SET_CONSENT") {
+    void setVisualSearchConsent(msg.enabled === true)
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => sendResponse({ ok: false, error: String(err?.message ?? err) }));
+    return true;
+  }
+  if (msg?.type === "NEUTRALENS_VS_MARK_NUDGE_SEEN") {
+    void setVisualSearchNudgeSeen()
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => sendResponse({ ok: false, error: String(err?.message ?? err) }));
+    return true;
+  }
   if (msg?.type === "NEUTRALENS_SEARCH" && msg.payload) {
     const { imageUrl, imageDataUrl, sourceUrl, source, cropRegion } = msg.payload;
     (async () => {
@@ -193,7 +218,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             source: "image",
           }),
         });
-        sendResponse({ ok: true, query: query.trim(), products: out?.results ?? out?.products ?? [] });
+        sendResponse({
+          ok: true,
+          query: query.trim(),
+          products: out?.results ?? out?.products ?? [],
+          reason: out?.reason ?? null,
+          blockedLabel: out?.blockedLabel ?? null,
+        });
       } catch (err) {
         if (isContentSafetyError(err)) {
           notifyContentSafety();
@@ -211,6 +242,58 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 async function authHeaders() {
   const { neutralensToken } = await chrome.storage.local.get("neutralensToken");
   return neutralensToken ? { Authorization: `Bearer ${neutralensToken}` } : {};
+}
+
+// --- Task #273: visual-search (Lens) consent + rollout -----------------------
+// The extension is not Clerk-authed server-side, so Gate B consent is per-device
+// (chrome.storage.local). Default OFF; opt-out is immediate. Keys mirror the web
+// localStorage keys for consistency.
+const VS_CONSENT_KEY = "nl_visual_search_consent";
+const VS_NUDGE_SEEN_KEY = "nl_visual_search_nudge_seen";
+
+async function getVisualSearchConsent() {
+  try {
+    const data = await chrome.storage.local.get(VS_CONSENT_KEY);
+    return data[VS_CONSENT_KEY] === true;
+  } catch {
+    return false;
+  }
+}
+
+async function setVisualSearchConsent(enabled) {
+  await chrome.storage.local.set({ [VS_CONSENT_KEY]: enabled === true });
+}
+
+async function getVisualSearchNudgeSeen() {
+  try {
+    const data = await chrome.storage.local.get(VS_NUDGE_SEEN_KEY);
+    return data[VS_NUDGE_SEEN_KEY] === true;
+  } catch {
+    return false;
+  }
+}
+
+async function setVisualSearchNudgeSeen() {
+  await chrome.storage.local.set({ [VS_NUDGE_SEEN_KEY]: true });
+}
+
+// Resolve Gate A rollout + consent state for the popup/panel. Eligibility comes
+// from the server (/visual-search/config); consent/nudge-seen are local.
+async function getVisualSearchState() {
+  let eligible = false;
+  try {
+    const cfg = await fetchJson(`${NEUTRALENS_API_BASE}/visual-search/config`);
+    eligible = cfg?.eligible === true;
+  } catch {
+    // Fail closed — if the rollout state can't be read, treat as not eligible
+    // so we never promise a capability we won't serve.
+    eligible = false;
+  }
+  const [consent, nudgeSeen] = await Promise.all([
+    getVisualSearchConsent(),
+    getVisualSearchNudgeSeen(),
+  ]);
+  return { eligible, consent, nudgeSeen };
 }
 
 // Read the creator-referral cookie (nl_ref) that the website sets when a fan
@@ -288,10 +371,14 @@ async function runImageSearch({ imageUrl, sourceUrl, source, cropRegion }) {
   if (!fetched?.base64) {
     return openFallback(sourceUrl ?? imageUrl);
   }
+  // A server-side cropRegion (CORS-tainted tap-to-detect) or an explicit
+  // ext-tap source means this is a user-selected region → Lens may fire.
+  const isCropRegion = !!cropRegion || source === "ext-tap";
   return await runRecogniseAndSearch(
     { base64: fetched.base64, mimeType: fetched.mimeType ?? "image/jpeg" },
     source ?? "image",
     sourceUrl ?? imageUrl,
+    isCropRegion,
   );
 }
 
@@ -301,10 +388,12 @@ async function runDataUrlSearch({ imageDataUrl, sourceUrl, source }) {
   if (!match) return { ok: false, error: "Invalid image data" };
   const mimeType = match[1] ?? "image/jpeg";
   const base64 = match[2] ?? "";
+  // Client-side crops (tap-to-detect) arrive tagged ext-tap → Lens may fire.
   return await runRecogniseAndSearch(
     { base64, mimeType },
     source ?? "video-frame",
     sourceUrl,
+    source === "ext-tap",
   );
 }
 
@@ -382,24 +471,36 @@ async function openResultsTab(out, fallbackSourceUrl) {
   }
 }
 
-async function runRecogniseAndSearch({ base64, mimeType }, source, sourceUrl) {
+async function runRecogniseAndSearch({ base64, mimeType }, source, sourceUrl, isCropRegion = false) {
   // /recognise expects { base64, mimeType } and returns
-  // { imageHash, objects, enrichment, cached }.
+  // { imageHash, objects, enrichment, lensIdentity, cached }.
+  // Task #273: region crops may trigger best-effort Lens identity (subject to
+  // both server gates + the server guard). visualSearchConsent is the per-device
+  // consent flag; the server ignores it for Clerk-authed users.
+  const visualSearchConsent = await getVisualSearchConsent();
   const recog = await fetchJson(`${NEUTRALENS_API_BASE}/recognise`, {
     method: "POST",
-    body: JSON.stringify({ base64, mimeType }),
+    body: JSON.stringify({ base64, mimeType, isCropRegion, visualSearchConsent }),
   });
   const imageHash = recog?.imageHash;
   if (!imageHash) return openFallback(sourceUrl);
   const objects = Array.isArray(recog?.objects) ? recog.objects : [];
   const enrichment = recog?.enrichment ?? null;
+  // Task #273 precedence: a CONFIDENT Lens identity for the cropped region wins,
+  // then the GPT-4o enriched query, then the raw label. The server only attaches
+  // lensIdentity on a confident, purchasable match (its guard blocks
+  // non-purchasable regions before upload), so preferring it here is safe.
+  const lensTitle =
+    recog?.lensIdentity && typeof recog.lensIdentity.title === "string" && recog.lensIdentity.title.trim().length > 0
+      ? recog.lensIdentity.title.trim()
+      : null;
   // Prefer the enriched search query when GPT-4o gave us one — matches the
   // web app's behaviour and yields better cross-retailer matches.
   const enrichedQuery =
     enrichment && typeof enrichment.search_query === "string" && enrichment.search_query.trim().length > 0
       ? enrichment.search_query.trim()
       : null;
-  const query = enrichedQuery ?? objectsToQuery(objects) ?? "product";
+  const query = lensTitle ?? enrichedQuery ?? objectsToQuery(objects) ?? "product";
   const searchBody = {
     query,
     imageHash,
@@ -418,6 +519,8 @@ async function runRecogniseAndSearch({ base64, mimeType }, source, sourceUrl) {
     ok: true,
     query,
     products: out?.results ?? out?.products ?? [],
+    reason: out?.reason ?? null,
+    blockedLabel: out?.blockedLabel ?? null,
     enrichment,
     imageHash,
     isImageSearch: true,
