@@ -17,6 +17,20 @@
       .tier { font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #e2e8f0; color: #0f172a; }
       .tier.pro { background: #dbeafe; color: #1e40af; }
       .tier.premium { background: #ede9fe; color: #6d28d9; }
+      hr { border: none; border-top: 1px solid #e2e8f0; margin: 16px 0; }
+      @media (prefers-color-scheme: dark) { hr { border-top-color: #1e293b; } }
+      .vs-title { font-weight: 600; }
+      .vs-desc { font-size: 12px; color: #475569; margin: 4px 0 0; }
+      @media (prefers-color-scheme: dark) { .vs-desc { color: #94a3b8; } }
+      .vs-desc a { color: inherit; }
+      .hidden { display: none; }
+      /* iOS-style toggle */
+      .switch { position: relative; width: 40px; height: 24px; flex: 0 0 auto; }
+      .switch input { opacity: 0; width: 0; height: 0; }
+      .slider { position: absolute; inset: 0; background: #cbd5e1; border-radius: 999px; transition: 0.2s; cursor: pointer; }
+      .slider::before { content: ""; position: absolute; height: 18px; width: 18px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: 0.2s; }
+      .switch input:checked + .slider { background: #2563eb; }
+      .switch input:checked + .slider::before { transform: translateX(16px); }
     </style>
   </head>
   <body>
@@ -33,6 +47,24 @@
     <div class="row">
       <button id="refresh" type="button">Refresh tier</button>
       <button id="signout" type="button">Sign out</button>
+    </div>
+    <div id="vs-section" class="hidden">
+      <hr />
+      <div class="row" style="align-items: flex-start">
+        <div style="flex: 1">
+          <div class="vs-title">Visual search</div>
+          <p class="vs-desc">
+            Off by default. When on, the item you select in a photo is sent to our
+            visual-search provider to identify it, then deleted right away. We never keep
+            your photos or use them for training.
+            <a href="https://neutralens.com/privacy-policy" target="_blank" rel="noreferrer">Learn more</a>
+          </p>
+        </div>
+        <label class="switch">
+          <input id="vs-toggle" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+      </div>
     </div>
     <script src="popup.js" type="module"></script>
   </body>
