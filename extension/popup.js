@@ -30,4 +30,27 @@ document.getElementById("signout").addEventListener("click", async () => {
   await render();
 });
 
+// Visual-search consent toggle. Only shown when the feature
+// is live for this user; default OFF, opt-out immediate.
+const vsSection = document.getElementById("vs-section");
+const vsToggle = document.getElementById("vs-toggle");
+
+async function renderVisualSearch() {
+  const state = await chrome.runtime.sendMessage({ type: "NEUTRALENS_VS_GET_STATE" });
+  if (state?.eligible) {
+    vsToggle.checked = state.consent === true;
+    vsSection.classList.remove("hidden");
+  } else {
+    vsSection.classList.add("hidden");
+  }
+}
+
+vsToggle.addEventListener("change", async () => {
+  await chrome.runtime.sendMessage({
+    type: "NEUTRALENS_VS_SET_CONSENT",
+    enabled: vsToggle.checked,
+  });
+});
+
 void render();
+void renderVisualSearch();
