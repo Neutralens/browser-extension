@@ -6,8 +6,8 @@ The same `extension/` MV3 source is converted into a Safari Web Extension
 using Apple's official `safari-web-extension-converter` Xcode command-line
 tool.
 
-> Requires macOS 13+ with Xcode 15+ installed. **Cannot be run from
-> Replit** — Apple's converter only ships on macOS.
+> Requires macOS 13+ with Xcode 15+ installed. 
+> — Apple's converter only ships on macOS.
 
 ## One-time conversion
 
