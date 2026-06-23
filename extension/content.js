@@ -171,6 +171,271 @@
     return null;
   }
 
+  // --- High-resolution image extraction (page context) ---------------------
+  // Right-click "Search this image" frequently lands on a grid thumbnail or a
+  // lazy-load placeholder rather than the real, full-resolution image. On
+  // image-heavy sites the full-res URL lives in `srcset`, in a site-specific
+  // attribute, or in JSON embedded in a nearby <script>. These extractors lift
+  // it out so we search the real image, not a tiny preview.
+  //
+  // This is the WHOLE-IMAGE, NON-CROP right-click path. Resolution only ever
+  // swaps the thumbnail/placeholder URL for a HIGHER-RESOLUTION version of the
+  // SAME image — it never produces a crop region and must never trigger Lens.
+  // (Gated behind `allowHighResUpgrade` so the tap-to-crop / ext-tap flow,
+  // which reuses resolveImageUrl, is left completely unchanged — see below.)
+  //
+  // Adding support for another site = adding one entry to HIGH_RES_EXTRACTORS;
+  // the shared dispatch + srcset/attribute logic stays untouched. Every
+  // extractor is best-effort: any throw or miss falls through to the next
+  // extractor and ultimately to the original src, consistent with the rest of
+  // the recognition pipeline's best-effort philosophy.
+
+  function absolutizeUrl(url) {
+    if (typeof url !== "string" || !url) return null;
+    try {
+      return new URL(url, document.baseURI).href;
+    } catch {
+      return null;
+    }
+  }
+
+  // Generic srcset parser — picks the highest-resolution candidate by
+  // descriptor ('w' width or 'x' density; bare candidates count as 1x).
+  function pickHighestFromSrcset(srcset) {
+    if (typeof srcset !== "string" || !srcset.trim()) return null;
+    let bestUrl = null;
+    let bestScore = -1;
+    for (const part of srcset.split(",")) {
+      const seg = part.trim();
+      if (!seg) continue;
+      const sp = seg.split(/\s+/);
+      const url = sp[0];
+      if (!url) continue;
+      // Guard against a malformed srcset (e.g. a stray word): a real candidate
+      // is a URL, so it must contain a path separator, dot, or scheme colon.
+      // Without this, a junk token would later absolutize against the page
+      // origin and masquerade as a valid https image URL.
+      if (!/[/.:]/.test(url)) continue;
+      const desc = sp[1] ?? "1x";
+      const m = /^(\d+(?:\.\d+)?)[wx]$/.exec(desc);
+      const score = m ? parseFloat(m[1]) : 1;
+      if (score > bestScore) {
+        bestScore = score;
+        bestUrl = url;
+      }
+    }
+    return bestUrl;
+  }
+
+  function extractFromSrcset(img) {
+    const sources = [];
+    const ownSrcset = img.getAttribute("srcset") || img.srcset;
+    if (ownSrcset) sources.push(ownSrcset);
+    const picture = img.closest("picture");
+    if (picture) {
+      for (const s of picture.querySelectorAll("source")) {
+        const ss = s.getAttribute("srcset");
+        if (ss) sources.push(ss);
+      }
+    }
+    const dataSrcset = img.getAttribute("data-srcset");
+    if (dataSrcset) sources.push(dataSrcset);
+    for (const ss of sources) {
+      const abs = absolutizeUrl(pickHighestFromSrcset(ss));
+      if (abs && abs.startsWith("https://")) return abs;
+    }
+    return null;
+  }
+
+  // Lazy-load galleries stash the real image in a data-* attribute or wrap the
+  // thumbnail in an <a> that links straight to the full-size file.
+  function extractFromLazyAttributes(img) {
+    const attrs = [
+      "data-iurl",
+      "data-src",
+      "data-original",
+      "data-lazy-src",
+      "data-lazy",
+      "data-hi-res-src",
+      "data-high-res-src",
+      "data-full-src",
+      "data-image",
+      "data-zoom-image",
+      "data-large-file",
+      "data-orig-file",
+    ];
+    for (const a of attrs) {
+      const v = absolutizeUrl(img.getAttribute(a));
+      if (v && v.startsWith("https://")) return v;
+    }
+    const linked = absolutizeUrl(img.closest("a")?.getAttribute("href"));
+    if (
+      linked &&
+      linked.startsWith("https://") &&
+      /\.(jpe?g|png|webp|gif|avif)(\?|$)/i.test(linked)
+    ) {
+      return linked;
+    }
+    const dataUrlAttr = absolutizeUrl(
+      img.closest("[data-url]")?.getAttribute("data-url"),
+    );
+    if (dataUrlAttr && dataUrlAttr.startsWith("https://")) return dataUrlAttr;
+    return null;
+  }
+
+  // Scan a bounded number of embedded JSON scripts for an image URL. `pick`
+  // returns a candidate string from a single object node (or null).
+  function extractFromJsonScripts(pick) {
+    const scripts = document.querySelectorAll(
+      'script[type="application/ld+json"], script[type="application/json"]',
+    );
+    let count = 0;
+    for (const s of scripts) {
+      if (count >= 20) break;
+      count += 1;
+      let data;
+      try {
+        data = JSON.parse(s.textContent || "");
+      } catch {
+        continue;
+      }
+      const found = walkJsonForImage(data, pick, 0);
+      const abs = absolutizeUrl(found);
+      if (abs && abs.startsWith("https://")) return abs;
+    }
+    return null;
+  }
+
+  function walkJsonForImage(node, pick, depth) {
+    if (!node || depth > 6) return null;
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const r = walkJsonForImage(item, pick, depth + 1);
+        if (r) return r;
+      }
+      return null;
+    }
+    if (typeof node === "object") {
+      const direct = pick(node);
+      if (typeof direct === "string" && direct) return direct;
+      for (const key of Object.keys(node)) {
+        const r = walkJsonForImage(node[key], pick, depth + 1);
+        if (r) return r;
+      }
+    }
+    return null;
+  }
+
+  // Pinterest — pinimg.com URLs carry a leading size token (/236x/, /474x/,
+  // /736x/, /originals/). Prefer the largest declared srcset candidate, then
+  // upgrade the size token to /originals/.
+  function extractPinterest(img) {
+    const upgradePinimg = (u) => {
+      const abs = absolutizeUrl(u);
+      if (!abs) return null;
+      try {
+        const parsed = new URL(abs);
+        if (!/(^|\.)pinimg\.com$/.test(parsed.hostname)) return null;
+        parsed.pathname = parsed.pathname.replace(/^\/\d+x\d*\//, "/originals/");
+        return parsed.href;
+      } catch {
+        return null;
+      }
+    };
+    const fromSrcset = extractFromSrcset(img);
+    const current = img.currentSrc || img.src || "";
+    return upgradePinimg(fromSrcset) || upgradePinimg(current) || fromSrcset;
+  }
+
+  // Instagram — feed/post images expose a srcset of CDN candidates; the
+  // largest is the real image. Fall back to embedded JSON (display_url).
+  function extractInstagram(img) {
+    const fromSrcset = extractFromSrcset(img);
+    if (fromSrcset) return fromSrcset;
+    return extractFromJsonScripts((obj) => {
+      const u = obj?.display_url || obj?.display_src;
+      return typeof u === "string" ? u : null;
+    });
+  }
+
+  // X/Twitter — pbs.twimg.com/media/<id> uses ?name=small|medium|large|orig to
+  // control served resolution; force the original.
+  function extractTwitter(img) {
+    const current = img.currentSrc || img.src || "";
+    const abs = absolutizeUrl(current);
+    if (abs) {
+      try {
+        const parsed = new URL(abs);
+        if (
+          /(^|\.)twimg\.com$/.test(parsed.hostname) &&
+          parsed.pathname.startsWith("/media/")
+        ) {
+          parsed.searchParams.set("name", "orig");
+          return parsed.href;
+        }
+      } catch {
+        // fall through to srcset
+      }
+    }
+    return extractFromSrcset(img);
+  }
+
+  // Tumblr — media.tumblr.com URLs carry a size token (/s540x810/); bump it to
+  // a large ceiling Tumblr honours. Prefer the declared srcset first.
+  function extractTumblr(img) {
+    const upgrade = (u) => {
+      const abs = absolutizeUrl(u);
+      if (!abs) return null;
+      try {
+        const parsed = new URL(abs);
+        if (!/(^|\.)media\.tumblr\.com$/.test(parsed.hostname)) return null;
+        if (/\/s\d+x\d+\//.test(parsed.pathname)) {
+          parsed.pathname = parsed.pathname.replace(
+            /\/s\d+x\d+\//,
+            "/s2048x3072/",
+          );
+          return parsed.href;
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    };
+    const fromSrcset = extractFromSrcset(img);
+    const current = img.currentSrc || img.src || "";
+    return upgrade(fromSrcset) || upgrade(current) || fromSrcset;
+  }
+
+  // Per-site extractor registry. `host` decides which one applies to the
+  // current page; matched site extractors run first (they know the real
+  // high-res source), then the generic srcset parser, then attribute hints.
+  const HIGH_RES_EXTRACTORS = [
+    { host: (h) => /(^|\.)pinterest\.[a-z.]+$/.test(h), extract: extractPinterest },
+    { host: (h) => /(^|\.)instagram\.com$/.test(h), extract: extractInstagram },
+    { host: (h) => /(^|\.)(twitter\.com|x\.com)$/.test(h), extract: extractTwitter },
+    { host: (h) => /(^|\.)tumblr\.com$/.test(h), extract: extractTumblr },
+  ];
+
+  function extractHighResUrl(imgElement) {
+    if (!imgElement) return null;
+    const host = (location.hostname || "").toLowerCase();
+    const chain = [
+      ...HIGH_RES_EXTRACTORS.filter((e) => e.host(host)).map((e) => e.extract),
+      extractFromSrcset,
+      extractFromLazyAttributes,
+    ];
+    for (const fn of chain) {
+      try {
+        const url = fn(imgElement);
+        if (typeof url === "string" && url.startsWith("https://")) return url;
+      } catch {
+        // Best-effort: site markup changes without notice, so a single
+        // extractor throwing must not abort resolution.
+      }
+    }
+    return null;
+  }
+
   async function blobUrlToDataUrl(blobUrl) {
     const response = await fetch(blobUrl);
     if (!response.ok) throw new Error(`blob fetch failed: HTTP ${response.status}`);
@@ -192,14 +457,32 @@
     return null;
   }
 
-  async function resolveImageUrl(srcUrl, imgElement) {
+  // `allowHighResUpgrade` is opt-in and ONLY set by the whole-image right-click
+  // path. It swaps the clicked thumbnail/placeholder for a higher-resolution
+  // version of the SAME image via the extractor registry above. The tap-to-crop
+  // / ext-tap flow calls this without the flag so its behaviour is unchanged —
+  // a high-res swap there would invalidate the user's crop-region coordinates.
+  async function resolveImageUrl(srcUrl, imgElement, options = {}) {
+    const allowHighResUpgrade = options.allowHighResUpgrade === true;
     if (typeof srcUrl !== "string" || srcUrl.length === 0) {
       return { type: "fallback", value: srcUrl ?? "" };
     }
-    if (srcUrl.startsWith("https://")) return { type: "url", value: srcUrl };
+    const el = imgElement ?? findImgBySrc(srcUrl);
+    if (srcUrl.startsWith("https://")) {
+      // Already fetchable, but the clicked src may be a thumbnail or a
+      // lazy-load placeholder. Attempt a same-image high-res upgrade; fall back
+      // to the original https src when no extractor matches or returns nothing.
+      if (allowHighResUpgrade && el) {
+        const hi = extractHighResUrl(el);
+        if (hi && hi !== srcUrl) return { type: "url", value: hi };
+      }
+      return { type: "url", value: srcUrl };
+    }
     if (srcUrl.startsWith("data:")) return { type: "dataUrl", value: srcUrl };
     if (srcUrl.startsWith("blob:")) {
-      const domUrl = extractRealUrlFromDom(imgElement ?? findImgBySrc(srcUrl));
+      const domUrl = allowHighResUpgrade
+        ? extractHighResUrl(el)
+        : extractRealUrlFromDom(el);
       if (domUrl) return { type: "url", value: domUrl };
       try {
         const dataUrl = await blobUrlToDataUrl(srcUrl);
@@ -209,7 +492,12 @@
       }
     }
     if (srcUrl.startsWith("http://")) {
-      return { type: "url", value: "https://" + srcUrl.slice("http://".length) };
+      const httpsUrl = "https://" + srcUrl.slice("http://".length);
+      if (allowHighResUpgrade && el) {
+        const hi = extractHighResUrl(el);
+        if (hi) return { type: "url", value: hi };
+      }
+      return { type: "url", value: httpsUrl };
     }
     return { type: "fallback", value: srcUrl };
   }
@@ -234,6 +522,9 @@
     // Drag by header.
     const header = panelShadow.querySelector(".header");
     header.addEventListener("pointerdown", (e) => {
+      // Don't start a drag when the pointer lands on an interactive control
+      // (e.g. the close button) — otherwise pointer capture swallows its click.
+      if (e.target.closest("button, a, input, select, textarea, [role='button']")) return;
       const rect = panelHost.getBoundingClientRect();
       panelDragOffset = { x: e.clientX - rect.left, y: e.clientY - rect.top };
       header.setPointerCapture(e.pointerId);
@@ -250,7 +541,11 @@
       panelDragOffset = null;
     });
 
-    panelShadow.querySelector(".close").addEventListener("click", closePanel);
+    const closeBtn = panelShadow.querySelector(".close");
+    // Stop the close button's pointerdown from reaching the header's drag
+    // handler, so the click fires even if the header markup changes.
+    closeBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
+    closeBtn.addEventListener("click", closePanel);
 
     // Escape to close (key listener on document — does not modify host DOM).
     document.addEventListener("keydown", onEscape);
@@ -435,6 +730,8 @@
     const products = Array.isArray(resp.products) ? resp.products : [];
     const query = resp.query ?? null;
     const enrichment = resp.enrichment ?? null;
+    const reason = resp.reason ?? null;
+    const blockedLabel = resp.blockedLabel ?? null;
     const imageHash = typeof resp.imageHash === "string" ? resp.imageHash : null;
     const isImageSearch = resp.isImageSearch !== false && (imageHash !== null || enrichment !== null);
     const objectsDetected = Array.isArray(resp.objectsDetected) ? resp.objectsDetected : [];
@@ -469,6 +766,8 @@
       products,
       query,
       enrichment,
+      reason,
+      blockedLabel,
       isImageSearch,
       objectCandidates,
       defaultObjectQuery,
@@ -502,6 +801,8 @@
         products,
         query: resp.query ?? label,
         enrichment: ctx.enrichment,
+        reason: resp.reason ?? null,
+        blockedLabel: resp.blockedLabel ?? null,
         isImageSearch: ctx.isImageSearch,
         chosenLabel: label,
         objectCandidates: ctx.objectCandidates,
@@ -977,6 +1278,8 @@
       products,
       query: resp.query ?? null,
       enrichment,
+      reason: resp.reason ?? null,
+      blockedLabel: resp.blockedLabel ?? null,
       isImageSearch: true,
       objectCandidates: [],
       regionSearch: true,
@@ -1095,6 +1398,21 @@
         }
         .badge.medium { border-color: #6ee7b7; color: #047857; }
         .badge.low { border-color: #fcd34d; color: #b45309; }
+        .vs-nudge {
+          margin-bottom: 10px; padding: 10px; border-radius: 8px;
+          background: #eff6ff; border: 1px solid #bfdbfe;
+        }
+        .vs-nudge-text { font-size: 11px; line-height: 1.45; color: #1e3a5f; }
+        .vs-nudge-text a { color: #2563eb; }
+        .vs-nudge-actions { display: flex; gap: 8px; margin-top: 8px; }
+        .vs-nudge-enable, .vs-nudge-dismiss {
+          cursor: pointer; font: 600 11px/1 -apple-system, system-ui, sans-serif;
+          padding: 7px 12px; border-radius: 999px; border: 1px solid #2563eb;
+        }
+        .vs-nudge-enable { background: #2563eb; color: #ffffff; }
+        .vs-nudge-enable:hover { background: #1d4ed8; border-color: #1d4ed8; }
+        .vs-nudge-dismiss { background: #ffffff; color: #2563eb; }
+        .vs-nudge-dismiss:hover { background: #dbeafe; }
         .chips-label { font-size: 11px; color: #475569; margin: 8px 0 4px; }
         .object-picker { margin-bottom: 10px; }
         .object-picker .chips-label { margin-top: 0; font-weight: 600; }
@@ -1181,9 +1499,17 @@
         ? `<div class="tap-cta"><button type="button" class="tap-btn" data-tap-detect>Tap to detect any object</button></div>`
         : "";
       const enrichmentHtml = renderEnrichmentHtml(state);
+      // Non-purchasable label: the server blocked a person/face/etc. query
+      // before searching. Replace the blank "No matches" with an actionable
+      // prompt — the object-picker chips render above so the user can tap the
+      // real item they want to shop.
+      const blockedMsg =
+        state.reason === "non_purchasable_label"
+          ? `We spotted ${state.blockedLabel ? `a ${state.blockedLabel}` : "a person"}. Tap the item you want to shop (shoe, top, bag).`
+          : null;
       const itemsHtml =
         items.length === 0
-          ? `<div class="empty">${escapeHtml(state.emptyHint ?? "No matches found.")}</div>`
+          ? `<div class="empty">${escapeHtml(blockedMsg ?? state.emptyHint ?? "No matches found.")}</div>`
           : items
               .slice(0, 10)
               .map(
@@ -1199,7 +1525,10 @@
           `,
               )
               .join("");
-      body.innerHTML = regionBarHtml + objectPickerHtml + tapCtaHtml + enrichmentHtml + itemsHtml;
+      body.innerHTML =
+        `<div data-vs-nudge></div>` + regionBarHtml + objectPickerHtml + tapCtaHtml + enrichmentHtml + itemsHtml;
+      // Task #273: first-run visual-search nudge (Gate A gated, once per device).
+      void maybeRenderVsNudge(body);
       // Wire the tap-to-detect entry and "Back to full image" controls.
       const tapBtn = body.querySelector("[data-tap-detect]");
       if (tapBtn) tapBtn.addEventListener("click", () => activateTapMode());
@@ -1235,6 +1564,54 @@
           btn.addEventListener("mouseleave", clearObjectHighlight);
           btn.addEventListener("blur", clearObjectHighlight);
         }
+      });
+    }
+  }
+
+  // Task #273: render the first-run visual-search nudge into the results panel.
+  // Shown once per device, only to Gate-A-eligible users who haven't already
+  // consented or seen it. Enable turns consent on; both buttons mark it seen.
+  async function maybeRenderVsNudge(body) {
+    const slot = body.querySelector("[data-vs-nudge]");
+    if (!slot) return;
+    let state;
+    try {
+      state = await chrome.runtime.sendMessage({ type: "NEUTRALENS_VS_GET_STATE" });
+    } catch {
+      return;
+    }
+    if (!state?.eligible || state.consent === true || state.nudgeSeen === true) return;
+    slot.innerHTML = `
+      <div class="vs-nudge">
+        <div class="vs-nudge-text">
+          Want sharper matches? Turn on visual search to identify the exact item you
+          select. Your photo is sent to our visual-search provider just to find it,
+          then deleted — never kept or used for training.
+          <a href="https://neutralens.com/privacy-policy" target="_blank" rel="noreferrer">Learn more</a>
+        </div>
+        <div class="vs-nudge-actions">
+          <button type="button" class="vs-nudge-enable" data-vs-enable>Turn on</button>
+          <button type="button" class="vs-nudge-dismiss" data-vs-dismiss>Not now</button>
+        </div>
+      </div>`;
+    const markSeen = () => {
+      chrome.runtime.sendMessage({ type: "NEUTRALENS_VS_MARK_NUDGE_SEEN" }).catch(() => {});
+    };
+    const enableBtn = slot.querySelector("[data-vs-enable]");
+    if (enableBtn) {
+      enableBtn.addEventListener("click", () => {
+        chrome.runtime
+          .sendMessage({ type: "NEUTRALENS_VS_SET_CONSENT", enabled: true })
+          .catch(() => {});
+        markSeen();
+        slot.innerHTML = "";
+      });
+    }
+    const dismissBtn = slot.querySelector("[data-vs-dismiss]");
+    if (dismissBtn) {
+      dismissBtn.addEventListener("click", () => {
+        markSeen();
+        slot.innerHTML = "";
       });
     }
   }
@@ -1449,7 +1826,12 @@
       // never hangs waiting on us.
       (async () => {
         try {
-          const resolved = await resolveImageUrl(msg.srcUrl, null);
+          // Whole-image right-click path: enable the high-res upgrade and hand
+          // the resolver the element the user right-clicked (captured by the
+          // contextmenu listener) so site-specific extractors can run.
+          const resolved = await resolveImageUrl(msg.srcUrl, pendingSourceEl, {
+            allowHighResUpgrade: true,
+          });
           sendResponse(resolved);
         } catch (err) {
           sendResponse({ type: "fallback", value: msg.srcUrl ?? "", error: String(err?.message ?? err) });
